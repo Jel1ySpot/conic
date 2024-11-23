@@ -9,5 +9,5 @@ func (a Adapter) Encode(v any) ([]byte, error) {
 }
 
 func (a Adapter) Decode(b []byte, v any) error {
-    return json.Unmarshal(b, &v)
+    return json.Unmarshal(b, v)
 }

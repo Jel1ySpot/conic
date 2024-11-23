@@ -112,7 +112,7 @@ func New() *Conic {
 func ReadInConfig() error { return c.ReadInConfig() }
 
 func (c *Conic) ReadInConfig() error {
-    c.logger("attempting to read in config file")
+    c.logger("attempting to read in config file\n")
     if c.configFile == "" {
         return NoConfigFileError{}
     }
@@ -126,10 +126,10 @@ func (c *Conic) ReadInConfig() error {
         return ConfigFileReadError{err}
     }
 
-    config := make(map[string]any)
+    var config map[string]any
 
-    err = c.adapter.Decode(file, config)
-    if err != nil {
+    err = c.adapter.Decode(file, &config)
+    if config == nil || err != nil {
         return ConfigFileReadError{err}
     }
 
