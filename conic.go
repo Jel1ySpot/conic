@@ -94,9 +94,9 @@ func New() *Conic {
     c := new(Conic)
     c.keyDelim = "."
     c.logger = func(format string, args ...interface{}) {
-        fmt.Printf(format, args...)
+        fmt.Printf(format+"\n", args...)
     }
-    c.configPermissions = os.FileMode(0o644)
+    c.configPermissions = os.ModePerm
     c.config = make(map[string]any)
     c.parents = []string{}
     c.override = make(map[string]any)
