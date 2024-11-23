@@ -146,6 +146,14 @@ func (c *Conic) ReadInConfig() error {
     return unmarshalAll()
 }
 
+func SetLogger(logger func(format string, args ...interface{})) {
+    c.SetLogger(logger)
+}
+
+func (c *Conic) SetLogger(logger func(format string, args ...interface{})) {
+    c.logger = logger
+}
+
 // SetConfigFile explicitly defines the path, name and extension of the config file.
 // Conic will use this and not check any of the config paths.
 func SetConfigFile(in string) { c.SetConfigFile(in) }
