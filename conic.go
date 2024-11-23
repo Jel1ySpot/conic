@@ -112,7 +112,7 @@ func New() *Conic {
 func ReadInConfig() error { return c.ReadInConfig() }
 
 func (c *Conic) ReadInConfig() error {
-    c.logger("attempting to read in config file\n")
+    c.logger("attempting to read in config file")
     if c.configFile == "" {
         return NoConfigFileError{}
     }
