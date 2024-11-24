@@ -124,25 +124,22 @@ func (c *Conic) SetConfigFile(in string) {
     }
 }
 
-func (c *Conic) setConfigAdapter() error {
-    switch c.getConfigType() {
-    case "json":
-        c.adapter = jsonAdapter.Adapter{}
-    default:
-        return UnsupportedConfigError(c.getConfigType())
-    }
-    return nil
-}
+// UseAdapter uses adapter for loading config
+func UseAdapter(a adapter.Adapter) { c.UseAdapter(a) }
+
+func (c *Conic) UseAdapter(a adapter.Adapter) { c.adapter = a }
 
 // SetConfigType sets the type of the configuration
 func SetConfigType(ext string) error { return c.SetConfigType(ext) }
 
 func (c *Conic) SetConfigType(ext string) error {
-    c.configType = ext
-    if err := c.setConfigAdapter(); err != nil {
-        c.configType = ""
-        return err
+    switch ext {
+    case "json":
+        c.UseAdapter(jsonAdapter.Adapter{})
+    default:
+        return UnsupportedConfigError(ext)
     }
+    c.configType = ext
     return nil
 }
 

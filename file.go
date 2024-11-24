@@ -16,7 +16,7 @@ func (c *Conic) ReadInConfig() error {
         return NoConfigFileError{}
     }
 
-    if err := c.setConfigAdapter(); err != nil {
+    if err := c.UseAdapter(); err != nil {
         return err
     }
 
