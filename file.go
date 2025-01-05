@@ -4,72 +4,61 @@ import (
     "fmt"
     "github.com/fsnotify/fsnotify"
     "os"
+    "path"
+    "path/filepath"
+    "strings"
     "sync"
 )
 
-// ReadInConfig loads the configuration file
-func ReadInConfig() error { return c.ReadInConfig() }
+type Config interface {
+    Type() string
+    Read() ([]byte, error)
+    Write(b []byte) error
+    OnChanged(cb func())
+}
 
-func (c *Conic) ReadInConfig() error {
-    c.logger("attempting to read in config file")
-    if c.configFile == "" {
+type RegularFile struct {
+    FileName string
+}
+
+func (f RegularFile) Type() string {
+    ext := strings.ToLower(filepath.Ext(f.FileName))
+
+    if len(ext) > 1 {
+        return ext[1:]
+    }
+
+    return ""
+}
+
+func (f RegularFile) Read() ([]byte, error) {
+    if f.FileName == "" {
+        return nil, NoConfigFileError{}
+    }
+
+    file, err := os.ReadFile(f.FileName)
+    if err != nil {
+        return nil, ConfigFileReadError{err}
+    }
+
+    return file, nil
+}
+
+func (f RegularFile) Write(b []byte) error {
+    if f.FileName == "" {
         return NoConfigFileError{}
     }
 
-    if err := c.UseAdapter(); err != nil {
-        return err
-    }
-
-    file, err := os.ReadFile(c.configFile)
-    if err != nil {
-        return ConfigFileReadError{err}
-    }
-
-    var config map[string]any
-
-    err = c.adapter.Decode(file, &config)
-    if config == nil || err != nil {
-        return ConfigFileReadError{err}
-    }
-
-    c.config = config
-
-    defer func() {
-        if len(c.onConfigLoad) > 0 {
-            for _, f := range c.onConfigLoad {
-                go f()
-            }
+    if dir := path.Dir(f.FileName); dir != "." {
+        err := os.MkdirAll(path.Dir(f.FileName), 0755)
+        if err != nil {
+            return err
         }
-    }()
-
-    return unmarshalAll()
+    }
+    return os.WriteFile(f.FileName, b, 0644)
 }
 
-// WriteConfig writes config in the configuration file
-func WriteConfig() error { return c.WriteConfig() }
-
-func (c *Conic) WriteConfig() error {
-    if err := c.marshalAll(); err != nil {
-        return err
-    }
-
-    b, err := c.adapter.Encode(c.config)
-    if err != nil {
-        return err
-    }
-
-    if err := os.WriteFile(c.configFile, b, os.ModePerm); err != nil {
-        return err
-    }
-
-    return nil
-}
-
-// WatchConfig starts watching a config file for changes.
-func WatchConfig() { c.WatchConfig() }
-
-// WatchConfig starts watching a config file for changes.
-func (c *Conic) WatchConfig() {
+func (f RegularFile) OnChanged(cb func()) {
     initWG := sync.WaitGroup{}
     initWG.Add(1)
     go func() {
@@ -92,9 +81,7 @@ func (c *Conic) WatchConfig() {
                     }
 
                     if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-                        if err := c.ReadInConfig(); err != nil {
-                            c.logger(fmt.Sprintf("read config file: %s", err))
-                        }
+                        cb()
                     } else if event.Has(fsnotify.Remove) {
                         eventsWG.Done()
                         return
@@ -109,7 +96,7 @@ func (c *Conic) WatchConfig() {
                 }
             }
         }()
-        watcher.Add(c.configFile)
+        watcher.Add(f.FileName)
         initWG.Done()   // done initializing the watch in this go routine, so the parent routine can move on...
         eventsWG.Wait() // now, wait for event loop to end in this go-routine...
     }()

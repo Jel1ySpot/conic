@@ -52,7 +52,7 @@ func main() {
     conic.WriteConfig()
     /* config.json
     {
-      "name": "alex",
+      "name": "Richard",
       "age": 28
     }
     */
