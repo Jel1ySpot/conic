@@ -35,7 +35,7 @@ func main() {
 
     // Read configuration file
     conic.SetConfigFile("config.json")
-    conic.ReadInConfig()
+    conic.ReadConfig()
     conic.WatchConfig()
     /* config.json
        {

@@ -258,10 +258,14 @@ func GetConic() *Conic {
 func BindRef(key string, ref any) { c.BindRef(key, ref) }
 
 func (c *Conic) BindRef(key string, ref any) {
+	var path []string
+	if key != "" {
+		path = strings.Split(key, c.keyDelim)
+	}
 	c.bindStructs = append(c.bindStructs, struct {
 		path []string
 		ref  any
-	}{path: strings.Split(key, c.keyDelim), ref: ref})
+	}{path: path, ref: ref})
 }
 
 func (c *Conic) marshalAll() error {
@@ -306,10 +310,18 @@ func (c SubConic) Type() string {
 }
 
 func (c *Conic) Sub(key string) *Conic {
-	path := strings.Split(key, c.keyDelim)
+	var path []string
+	if key != "" {
+		path = strings.Split(key, c.keyDelim)
+	}
 	newConfig := make(map[string]any)
 	c.BindRef(key, &newConfig)
-	defer c.unmarshalAll()
+	defer func(c *Conic) {
+		err := c.unmarshalAll()
+		if err != nil {
+			c.logger(fmt.Sprintf("config unmarshal error: %s", err))
+		}
+	}(c)
 	if key == "" {
 		return &Conic{
 			keyDelim:    c.keyDelim,
@@ -324,7 +336,7 @@ func (c *Conic) Sub(key string) *Conic {
 	}
 
 	return &Conic{
-		keyDelim:   ".",
+		keyDelim:   c.keyDelim,
 		logger:     c.logger,
 		configType: c.configType,
 		parent:     c,
