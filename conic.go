@@ -209,7 +209,7 @@ func (c *Conic) ReadConfig() error {
 		}
 	}()
 
-	return unmarshalAll()
+	return c.unmarshalAll()
 }
 
 // WriteConfig writes config in the configuration file
