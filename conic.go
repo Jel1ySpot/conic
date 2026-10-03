@@ -1,347 +1,589 @@
+// Package conic binds Go structs to configuration files, with defaults,
+// environment overrides and typed access.
 package conic
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"errors"
 	"fmt"
-	"github.com/Jel1ySpot/conic/internal/adapter"
+	"os"
+	"reflect"
 	"strings"
+	"sync"
+
+	"github.com/Jel1ySpot/conic/internal/adapter"
+	"github.com/go-viper/mapstructure/v2"
 )
 
-// UnsupportedConfigError denotes encountering an unsupported
-// configuration filetype.
-type UnsupportedConfigError string
+var std = New()
 
-// Error returns the formatted configuration error.
-func (str UnsupportedConfigError) Error() string {
-	return fmt.Sprintf("Unsupported Config Type %q", string(str))
+// GetConic returns the default instance used by the package-level functions.
+func GetConic() *Conic { return std }
+
+// adapters maps config types (file extensions) to adapters.
+var adapters = map[string]adapter.Adapter{
+	"json": adapter.Json{},
+	"yaml": adapter.Yaml{},
+	"yml":  adapter.Yaml{},
 }
 
-// NoConfigFileError denotes failing when file path empty.
-type NoConfigFileError struct{}
-
-// Error returns the formatted configuration error.
-func (fnfe NoConfigFileError) Error() string {
-	return fmt.Sprintf("No Config File")
+type binding struct {
+	absPath  []string
+	ref      any
+	typ      reflect.Type
+	base     any
+	defaults []tagEntry
+	envs     []tagEntry
 }
 
-// ConfigFileReadError denotes failing when reading file.
-type ConfigFileReadError struct {
-	err error
-}
+// state is the shared state behind a Conic and all of its Sub views.
+type state struct {
+	mu sync.RWMutex
 
-// Error returns the formatted configuration error.
-func (cfre ConfigFileReadError) Error() string {
-	return fmt.Sprintf("Reading Config File Failed: %v", cfre.err)
-}
-
-// ConfigFileAlreadyExistsError denotes failure to write new configuration file.
-type ConfigFileAlreadyExistsError string
-
-// Error returns the formatted error when configuration already exists.
-func (faee ConfigFileAlreadyExistsError) Error() string {
-	return fmt.Sprintf("Config File %q Already Exists", string(faee))
-}
-
-// ConfigMarshalError happens when failing to marshal the configuration.
-type ConfigMarshalError struct {
-	err error
-}
-
-// Error returns the formatted configuration error.
-func (e ConfigMarshalError) Error() string {
-	return fmt.Sprintf("While marshaling config: %s", e.err.Error())
-}
-
-var c *Conic
-
-func init() {
-	c = New()
-}
-
-type Conic struct {
 	keyDelim string
+	logger   func(format string, args ...any)
 
-	logger func(format string, args ...interface{})
+	configFile      string
+	configType      string
+	adapter         adapter.Adapter
+	adapterExplicit bool
 
-	configInput Config
-	configType  string
+	data     map[string]any
+	bindings []*binding
 
-	bindStructs []struct {
-		path []string
-		ref  any
-	}
+	// Caches rebuilt by rebuildLayersLocked whenever the bindings change.
+	defaultsTree map[string]any // never modified after construction
+	defaults     *flatLayer
+	envs         *flatLayer
 
-	parent     *Conic
-	parentPath []string
+	loadHooks  []func()
+	errorHooks []func(error)
 
-	config map[string]any
+	lastHash [32]byte
 
-	onConfigLoad []func()
-
-	adapter adapter.Adapter
+	watcher *watcher
 }
 
-// New returns an initialized Conic instance.
+// Conic is a view onto a configuration state, rooted at a key prefix.
+type Conic struct {
+	s      *state
+	prefix []string
+}
+
+// New returns an initialized, independent Conic instance.
 func New() *Conic {
-	c := new(Conic)
-	c.keyDelim = "."
-	c.logger = func(format string, args ...interface{}) {
-		fmt.Printf(format+"\n", args...)
+	s := &state{
+		keyDelim: ".",
+		data:     map[string]any{},
 	}
-	c.configInput = RegularFile{}
-	c.config = make(map[string]any)
-	c.parentPath = []string{}
-
-	return c
+	s.rebuildLayersLocked()
+	return &Conic{s: s}
 }
 
-func SetLogger(logger func(format string, args ...interface{})) {
-	c.SetLogger(logger)
+func (c *Conic) path(key string) []string {
+	return joinPath(c.prefix, splitKey(key, c.s.keyDelim)...)
 }
 
-func (c *Conic) SetLogger(logger func(format string, args ...interface{})) {
-	c.logger = logger
+func (s *state) joinKey(path []string) string { return strings.Join(path, s.keyDelim) }
+
+// Sub returns a view whose keys are relative to key. It shares all state with
+// the receiver.
+func (c *Conic) Sub(key string) *Conic {
+	return &Conic{s: c.s, prefix: c.path(key)}
 }
 
-// SetConfigFile explicitly defines the path, name and extension of the config file.
-// Conic will use this and not check any of the config paths.
-func SetConfigFile(in string) { c.SetConfigFile(in) }
+// Sub is Conic.Sub on the default instance.
+func Sub(key string) *Conic { return std.Sub(key) }
 
-func (c *Conic) SetConfigFile(in string) {
-	if in != "" {
-		c.configInput = RegularFile{in}
-		_ = c.SetConfigType(c.configInput.Type())
+// ---- logging ----------------------------------------------------------
+
+// SetLogger sets the logger. The default is nil: nothing is logged.
+func (c *Conic) SetLogger(logger func(format string, args ...any)) {
+	c.s.mu.Lock()
+	defer c.s.mu.Unlock()
+	c.s.logger = logger
+}
+
+// SetLogger is Conic.SetLogger on the default instance.
+func SetLogger(logger func(format string, args ...any)) { std.SetLogger(logger) }
+
+// logf must not be called while holding s.mu.
+func (s *state) logf(format string, args ...any) {
+	s.mu.RLock()
+	l := s.logger
+	s.mu.RUnlock()
+	if l != nil {
+		l(format, args...)
 	}
 }
 
-// UseAdapter uses adapter for loading config
-func UseAdapter(a adapter.Adapter) { c.UseAdapter(a) }
+// ---- file / adapter configuration --------------------------------------
 
-func (c *Conic) UseAdapter(a adapter.Adapter) { c.adapter = a }
-
-// SetConfigType sets the type of the configuration
-func SetConfigType(ext string) error { return c.SetConfigType(ext) }
-
-func (c *Conic) SetConfigType(ext string) error {
-	if ext == "" {
-		ext = c.getConfigType()
-	}
-	c.configType = ext
-	switch ext {
-	case "json":
-		c.UseAdapter(adapter.Json{})
-	case "yaml":
-		c.UseAdapter(adapter.Yaml{})
-	default:
-		return UnsupportedConfigError(ext)
-	}
-	return nil
-}
-
-func (c *Conic) getConfigType() string {
-	if c.parent != nil {
-		return c.parent.getConfigType()
-	}
-	if c.configType != "" {
-		return c.configType
-	}
-
-	if c.configInput != nil {
-		return c.configInput.Type()
-	}
-
-	return ""
-}
-
-func searchMap(source map[string]any, path []string) map[string]any {
-	if len(path) == 0 {
-		return source
-	}
-
-	next, ok := source[path[0]]
-	if ok {
-		switch next := next.(type) {
-		case map[string]any:
-			if next == nil {
-				source[path[0]] = make(map[string]any)
-			}
-			if len(path) == 1 {
-				return next
-			}
-			return searchMap(next, path[1:])
-		default:
-			return nil
-		}
-	} else if len(path) == 1 {
-		source[path[0]] = make(map[string]any)
-		return source[path[0]].(map[string]any)
-	}
-	return nil
-}
-
-// ReadConfig loads the configuration file
-func ReadConfig() error { return c.ReadConfig() }
-
-func (c *Conic) ReadConfig() error {
-	if c.parent != nil {
-		return c.parent.ReadConfig()
-	}
-	c.logger("attempting to read in config file")
-
-	file, err := c.configInput.Read()
-	if err != nil {
-		return err
-	}
-
-	var config map[string]any
-
-	err = c.adapter.Decode(file, &config)
-	if config == nil || err != nil {
-		return ConfigFileReadError{err}
-	}
-
-	c.config = config
-
-	defer func() {
-		if len(c.onConfigLoad) > 0 {
-			for _, f := range c.onConfigLoad {
-				go f()
-			}
-		}
-	}()
-
-	return c.unmarshalAll()
-}
-
-// WriteConfig writes config in the configuration file
-func WriteConfig() error { return c.WriteConfig() }
-
-func (c *Conic) WriteConfig() error {
-	if c.parent != nil {
-		return c.parent.WriteConfig()
-	}
-	if err := c.marshalAll(); err != nil {
-		return err
-	}
-
-	b, err := c.adapter.Encode(c.config)
-	if err != nil {
-		return err
-	}
-
-	if err := c.configInput.Write(b); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// WatchConfig starts watching a config file for changes.
-func WatchConfig() { c.WatchConfig() }
-
-// WatchConfig starts watching a config file for changes.
-func (c *Conic) WatchConfig() {
-	if c.parent != nil {
-		c.parent.WatchConfig()
+// SetConfigFile sets the config file path. Unless an adapter or config type
+// was set explicitly, the adapter is inferred from the extension.
+func (c *Conic) SetConfigFile(path string) {
+	s := c.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.configFile = path
+	if path == "" || s.adapterExplicit {
 		return
 	}
-	c.configInput.OnChanged(func() {
-		if err := c.ReadConfig(); err != nil {
-			c.logger(fmt.Sprintf("read config file: %s", err))
-		}
-	})
+	s.configType = extOf(path)
+	s.adapter = adapters[s.configType] // nil if unknown; reported on Read/Write
 }
 
-func GetConic() *Conic {
-	return c
-}
+// SetConfigFile is Conic.SetConfigFile on the default instance.
+func SetConfigFile(path string) { std.SetConfigFile(path) }
 
-func BindRef(key string, ref any) { c.BindRef(key, ref) }
-
-func (c *Conic) BindRef(key string, ref any) {
-	var path []string
-	if key != "" {
-		path = strings.Split(key, c.keyDelim)
+// SetConfigType explicitly sets the config type ("json", "yaml", "yml").
+func (c *Conic) SetConfigType(ext string) error {
+	ext = strings.ToLower(strings.TrimPrefix(ext, "."))
+	a, ok := adapters[ext]
+	if !ok {
+		return UnsupportedConfigError(ext)
 	}
-	c.bindStructs = append(c.bindStructs, struct {
-		path []string
-		ref  any
-	}{path: path, ref: ref})
+	s := c.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.configType = ext
+	s.adapter = a
+	s.adapterExplicit = true
+	return nil
 }
 
-func (c *Conic) marshalAll() error {
-	for _, s := range c.bindStructs {
-		data := searchMap(c.config, s.path)
-		b, err := c.adapter.Encode(s.ref)
+// SetConfigType is Conic.SetConfigType on the default instance.
+func SetConfigType(ext string) error { return std.SetConfigType(ext) }
+
+// UseAdapter sets a custom adapter, taking precedence over the file extension.
+func (c *Conic) UseAdapter(a adapter.Adapter) {
+	s := c.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.adapter = a
+	s.adapterExplicit = true
+}
+
+// UseAdapter is Conic.UseAdapter on the default instance.
+func UseAdapter(a adapter.Adapter) { std.UseAdapter(a) }
+
+// prepare returns the file path and adapter, or the matching error.
+func (s *state) prepare() (string, adapter.Adapter, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.prepareLocked()
+}
+
+func (s *state) prepareLocked() (string, adapter.Adapter, error) {
+	if s.configFile == "" {
+		return "", nil, NoConfigFileError{}
+	}
+	if s.adapter == nil {
+		return "", nil, UnsupportedConfigError(s.configType)
+	}
+	return s.configFile, s.adapter, nil
+}
+
+// ---- layers ------------------------------------------------------------
+
+func (s *state) envTreeLocked() map[string]any {
+	t := map[string]any{}
+	for _, b := range s.bindings {
+		for _, e := range b.envs {
+			if v, ok := os.LookupEnv(e.val); ok {
+				if p := joinPath(b.absPath, e.path...); len(p) > 0 {
+					setPath(t, p, v)
+				}
+			}
+		}
+	}
+	return t
+}
+
+func (s *state) mergedLocked() map[string]any {
+	out := map[string]any{}
+	mergeMaps(out, s.defaultsTree)
+	mergeMaps(out, s.data)
+	mergeMaps(out, s.envTreeLocked())
+	return out
+}
+
+// ---- decoding / syncing -------------------------------------------------
+
+func decodeBinding(b *binding, merged map[string]any) (reflect.Value, error) {
+	var in any = merged
+	if len(b.absPath) > 0 {
+		in, _ = lookup(merged, b.absPath)
+	}
+	nv := reflect.New(b.typ)
+	if b.typ.Kind() == reflect.Struct && !isLeafStruct(b.typ) {
+		// Start from the current value so that fields mapstructure ignores
+		// are preserved; every mapped field is reset first.
+		nv.Elem().Set(reflect.ValueOf(b.ref).Elem())
+		zeroMapped(nv.Elem())
+	}
+	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		TagName:          "mapstructure",
+		WeaklyTypedInput: true,
+		MatchName:        func(mapKey, fieldName string) bool { return mapKey == fieldName },
+		DecodeHook: mapstructure.ComposeDecodeHookFunc(
+			mapstructure.StringToTimeDurationHookFunc(),
+			mapstructure.StringToSliceHookFunc(","),
+			mapstructure.TextUnmarshallerHookFunc(),
+		),
+		Result: nv.Interface(),
+	})
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	if err := dec.Decode(in); err != nil {
+		return reflect.Value{}, err
+	}
+	return nv, nil
+}
+
+// decodeAllLocked decodes every binding from the merged view and, only if all
+// succeed, commits the results into the bound values.
+func (s *state) decodeAllLocked() error {
+	merged := s.mergedLocked()
+	vals := make([]reflect.Value, len(s.bindings))
+	for i, b := range s.bindings {
+		nv, err := decodeBinding(b, merged)
 		if err != nil {
-			return err
+			return BindError{Key: s.joinKey(b.absPath), Err: err}
 		}
-		if err := c.adapter.Decode(b, &data); err != nil {
-			return err
-		}
+		vals[i] = nv
+	}
+	for i, b := range s.bindings {
+		reflect.ValueOf(b.ref).Elem().Set(vals[i].Elem())
 	}
 	return nil
 }
 
-func unmarshalAll() error { return c.unmarshalAll() }
-
-func (c *Conic) unmarshalAll() error {
-	for _, s := range c.bindStructs {
-		data := searchMap(c.config, s.path)
-		if data == nil {
+// syncLocked writes the bound values into the file layer. In full mode every
+// value is written. Otherwise only leaves already present in the file layer or
+// differing from the current merged view are written, so defaults stay
+// defaults (IsSet stays false).
+func (s *state) syncLocked(full bool) {
+	var merged map[string]any
+	if !full {
+		merged = s.mergedLocked()
+	}
+	for _, b := range s.bindings {
+		col := &collector{}
+		plain, ok := toPlain(reflect.ValueOf(b.ref).Elem(), col)
+		if !ok {
 			continue
 		}
-		b, err := c.adapter.Encode(data)
-		if err != nil {
-			return err
+		if pm, isMap := plain.(map[string]any); isMap {
+			for _, e := range b.envs {
+				if _, set := os.LookupEnv(e.val); set {
+					deleteAt(pm, e.path)
+				}
+			}
 		}
-		if err := c.adapter.Decode(b, s.ref); err != nil {
-			return err
+		for _, p := range col.omitted {
+			deleteAt(s.data, joinPath(b.absPath, p...))
 		}
+		if full {
+			mergeAt(s.data, b.absPath, plain)
+		} else {
+			s.syncIncremental(b.absPath, plain, merged)
+		}
+	}
+}
+
+func (s *state) syncIncremental(path []string, plain any, merged map[string]any) {
+	if pm, ok := plain.(map[string]any); ok && len(pm) > 0 {
+		for k, v := range pm {
+			s.syncIncremental(joinPath(path, k), v, merged)
+		}
+		return
+	}
+	if len(path) == 0 {
+		return
+	}
+	_, inData := lookup(s.data, path)
+	cur, _ := lookup(merged, path)
+	if inData || fmt.Sprint(cur) != fmt.Sprint(plain) {
+		mergeAt(s.data, path, plain)
+	}
+}
+
+// ---- binding -------------------------------------------------------------
+
+// BindRef binds the pointer ref to the config at key. The value is filled
+// immediately from defaults, tags and environment, and again on every
+// ReadConfig/Set. ref's mapstructure tags (not json/yaml tags) name the keys.
+func (c *Conic) BindRef(key string, ref any) error {
+	abs := c.path(key)
+	s := c.s
+	v := reflect.ValueOf(ref)
+	if !v.IsValid() || v.Kind() != reflect.Ptr || v.IsNil() {
+		return BindError{Key: s.joinKey(abs), Err: errors.New("ref must be a non-nil pointer")}
+	}
+	typ := v.Type().Elem()
+	base, _ := toPlain(v.Elem(), nil)
+	defaults, envs := collectTags(typ)
+	b := &binding{absPath: abs, ref: ref, typ: typ, base: base, defaults: defaults, envs: envs}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldTree, oldDefaults, oldEnvs := s.defaultsTree, s.defaults, s.envs
+	s.bindings = append(s.bindings, b)
+	s.rebuildLayersLocked()
+	nv, err := decodeBinding(b, s.mergedLocked())
+	if err != nil {
+		s.bindings = s.bindings[:len(s.bindings)-1]
+		s.defaultsTree, s.defaults, s.envs = oldTree, oldDefaults, oldEnvs
+		return BindError{Key: s.joinKey(abs), Err: err}
+	}
+	v.Elem().Set(nv.Elem())
+	return nil
+}
+
+// BindRef is Conic.BindRef on the default instance.
+func BindRef(key string, ref any) error { return std.BindRef(key, ref) }
+
+// ---- reading / writing ---------------------------------------------------
+
+// load parses b and installs it as the file layer, transactionally. It does
+// not fire hooks.
+func (s *state) load(b []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path, ad, err := s.prepareLocked()
+	if err != nil {
+		return err
+	}
+	data := map[string]any{}
+	if len(bytes.TrimSpace(b)) > 0 {
+		var raw map[string]any
+		if err := ad.Decode(b, &raw); err != nil {
+			return ConfigParseError{Path: path, Err: err}
+		}
+		if raw != nil {
+			data = normalize(raw).(map[string]any)
+			if hasNulKey(data) {
+				return ConfigParseError{Path: path, Err: errNulKey}
+			}
+		}
+	}
+	old := s.data
+	s.data = data
+	if err := s.decodeAllLocked(); err != nil {
+		s.data = old
+		return err
+	}
+	s.lastHash = sha256.Sum256(b)
+	return nil
+}
+
+func (s *state) fireLoad() {
+	s.mu.RLock()
+	hooks := append([]func(){}, s.loadHooks...)
+	s.mu.RUnlock()
+	for _, f := range hooks {
+		f()
+	}
+}
+
+func (s *state) fireError(err error) {
+	s.mu.RLock()
+	hooks := append([]func(error){}, s.errorHooks...)
+	s.mu.RUnlock()
+	for _, f := range hooks {
+		f(err)
+	}
+}
+
+// sameAsLast reports whether b equals the last content read or written.
+func (s *state) sameAsLast(b []byte) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return sha256.Sum256(b) == s.lastHash
+}
+
+// ReadConfig reads the config file and updates all bound values. It is
+// all-or-nothing: on error nothing changes. OnConfigLoad hooks run afterwards.
+func (c *Conic) ReadConfig() error {
+	s := c.s
+	path, _, err := s.prepare()
+	if err != nil {
+		return err
+	}
+	s.logf("conic: reading config file %q", path)
+	b, err := readFile(path)
+	if err != nil {
+		return err
+	}
+	if err := s.load(b); err != nil {
+		return err
+	}
+	s.fireLoad()
+	return nil
+}
+
+// ReadConfig is Conic.ReadConfig on the default instance.
+func ReadConfig() error { return std.ReadConfig() }
+
+// WriteConfig synchronizes bound values into the file layer and writes the
+// file. Keys not described by any bound struct are preserved, and values that
+// come from environment variables are not written.
+func (c *Conic) WriteConfig() error {
+	s := c.s
+	s.mu.Lock()
+	path, ad, err := s.prepareLocked()
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.syncLocked(true)
+	b, err := ad.Encode(s.data)
+	if err != nil {
+		s.mu.Unlock()
+		return ConfigMarshalError{Err: err}
+	}
+	err = writeFile(path, b)
+	if err == nil {
+		s.lastHash = sha256.Sum256(b)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	s.logf("conic: wrote config file %q", path)
+	return nil
+}
+
+// WriteConfig is Conic.WriteConfig on the default instance.
+func WriteConfig() error { return std.WriteConfig() }
+
+// ---- access --------------------------------------------------------------
+
+// Get returns a copy of the merged value at key (defaults < file < env), or
+// nil if absent. An empty key returns the whole tree (relative to a Sub prefix).
+func (c *Conic) Get(key string) any {
+	s := c.s
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.getLocked(c.path(key))
+	if !ok {
+		return nil
+	}
+	return v
+}
+
+// Get is Conic.Get on the default instance.
+func Get(key string) any { return std.Get(key) }
+
+// GetString returns the value at key as a string ("" if absent).
+func (c *Conic) GetString(key string) string { return toString(c.Get(key)) }
+
+// GetString is Conic.GetString on the default instance.
+func GetString(key string) string { return std.GetString(key) }
+
+// GetInt returns the value at key as an int (0 if absent or not convertible).
+func (c *Conic) GetInt(key string) int { return toInt(c.Get(key)) }
+
+// GetInt is Conic.GetInt on the default instance.
+func GetInt(key string) int { return std.GetInt(key) }
+
+// IsSet reports whether key is present in the file layer or set by an
+// environment variable. Defaults do not count.
+func (c *Conic) IsSet(key string) bool {
+	s := c.s
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isSetLocked(c.path(key))
+}
+
+// IsSet is Conic.IsSet on the default instance.
+func IsSet(key string) bool { return std.IsSet(key) }
+
+// Set stores value at key in the file layer and refreshes all bound values.
+// Unsaved modifications of bound values are kept. Environment variables have
+// the highest priority, so Set does not override a value that comes from one.
+// If the new data cannot be decoded into the bound values, nothing changes and
+// a BindError is returned.
+func (c *Conic) Set(key string, value any) error {
+	s := c.s
+	p := c.path(key)
+	var plain any
+	if value != nil {
+		plain, _ = toPlain(reflect.ValueOf(value), nil)
+	}
+	if hasNulPath(p) || hasNulKey(plain) {
+		return BindError{Key: s.joinKey(p), Err: errNulKey}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncLocked(false)
+	old := deepCopy(s.data).(map[string]any)
+	if len(p) == 0 {
+		m, ok := plain.(map[string]any)
+		if !ok {
+			return BindError{Key: "", Err: errors.New("root value must be a map")}
+		}
+		s.data = m
+	} else {
+		setPath(s.data, p, plain)
+	}
+	if err := s.decodeAllLocked(); err != nil {
+		s.data = old
+		return err
 	}
 	return nil
 }
 
-type SubConic struct {
-	*Conic
+// Set is Conic.Set on the default instance.
+func Set(key string, value any) error { return std.Set(key, value) }
+
+// View runs fn under a read lock, for safely reading bound values. fn must
+// not call methods of conic (that would deadlock).
+func (c *Conic) View(fn func()) {
+	c.s.mu.RLock()
+	defer c.s.mu.RUnlock()
+	fn()
 }
 
-func (c SubConic) Type() string {
-	return c.getConfigType()
+// View is Conic.View on the default instance.
+func View(fn func()) { std.View(fn) }
+
+// Update runs fn under the write lock, for safely modifying bound values;
+// afterwards the values are synchronized so that Get sees them. fn must not
+// call methods of conic (that would deadlock).
+func (c *Conic) Update(fn func()) {
+	s := c.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn()
+	s.syncLocked(false)
 }
 
-func (c *Conic) Sub(key string) *Conic {
-	var path []string
-	if key != "" {
-		path = strings.Split(key, c.keyDelim)
-	}
-	newConfig := make(map[string]any)
-	c.BindRef(key, &newConfig)
-	defer func(c *Conic) {
-		err := c.unmarshalAll()
-		if err != nil {
-			c.logger(fmt.Sprintf("config unmarshal error: %s", err))
-		}
-	}(c)
-	if key == "" {
-		return &Conic{
-			keyDelim:    c.keyDelim,
-			logger:      c.logger,
-			configInput: c.configInput,
-			configType:  c.configType,
-			parent:      c,
-			parentPath:  c.parentPath,
-			config:      newConfig,
-			adapter:     c.adapter,
-		}
-	}
+// Update is Conic.Update on the default instance.
+func Update(fn func()) { std.Update(fn) }
 
-	return &Conic{
-		keyDelim:   c.keyDelim,
-		logger:     c.logger,
-		configType: c.configType,
-		parent:     c,
-		parentPath: append(c.parentPath, path...),
-		config:     newConfig,
-		adapter:    c.adapter,
-	}
+// OnConfigLoad registers fn to run (synchronously, without locks held) after
+// every successful ReadConfig, including reloads.
+func (c *Conic) OnConfigLoad(fn func()) {
+	c.s.mu.Lock()
+	defer c.s.mu.Unlock()
+	c.s.loadHooks = append(c.s.loadHooks, fn)
 }
+
+// OnConfigLoad is Conic.OnConfigLoad on the default instance.
+func OnConfigLoad(fn func()) { std.OnConfigLoad(fn) }
+
+// OnConfigError registers fn to run when an automatic reload fails. Manual
+// ReadConfig calls return their error instead.
+func (c *Conic) OnConfigError(fn func(error)) {
+	c.s.mu.Lock()
+	defer c.s.mu.Unlock()
+	c.s.errorHooks = append(c.s.errorHooks, fn)
+}
+
+// OnConfigError is Conic.OnConfigError on the default instance.
+func OnConfigError(fn func(error)) { std.OnConfigError(fn) }
